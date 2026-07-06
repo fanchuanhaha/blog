@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    outputs:
+      d1_id: ${{ steps.ensure-d1.outputs.d1_id }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,37 +37,33 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Ensure D1 database exists
+        id: ensure-d1
         run: |
-          # 尝试创建 D1 数据库（已存在则跳过）
-          OUTPUT=$(npx wrangler d1 create aiovtue-blog 2>&1) || true
-          echo "$OUTPUT"
-          # 从创建成功的输出中提取 database_id
-          DB_ID=$(echo "$OUTPUT" | grep -oP 'database_id\s*=\s*"\K[^"]+')
-          # 如果为空，说明数据库已存在，从列表中取
-          if [ -z "$DB_ID" ]; then
-            DB_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "
-              let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
-                const arr=JSON.parse(d);
-                const db=arr.find(x=>x.name==='aiovtue-blog');
-                if(db) process.stdout.write(db.uuid||db.database_id||'');
-              })")
-          fi
-          echo "database_id=$DB_ID"
-          # 注入到 wrangler.toml
-          sed -i "s/database_id = \".*\"/database_id = \"$DB_ID\"/" wrangler.toml
-          cat wrangler.toml
+          # 1. 尝试创建（已存在会报错，忽略）
+          npx wrangler d1 create aiovtue-blog 2>/dev/null || true
+          # 2. 从列表获取数据库 ID
+          DB_ID=$(npx wrangler d1 list --json 2>/dev/null | node -e "
+            let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+              const arr=JSON.parse(d);
+              const db=arr.find(x=>x.name==='aiovtue-blog');
+              if(db) process.stdout.write(db.uuid||db.database_id||'');
+            })")
+          echo "D1 database IDs: $DB_ID"
+          echo "d1_id=$DB_ID" >> $GITHUB_OUTPUT
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Apply D1 migrations (remote)
-        run: pnpm d1:migrate
+        run: npx wrangler d1 migrations apply aiovtue-blog --remote --database-id ${{ steps.ensure-d1.outputs.d1_id }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Sync content to D1
         run: |
+          # 临时注入 database_id 供迁移脚本使用
+          sed -i "s/database_id = \".*\"/database_id = \"${{ steps.ensure-d1.outputs.d1_id }}\"/" wrangler.toml
           pnpm migrate:posts
           pnpm migrate:links
           pnpm migrate:about
